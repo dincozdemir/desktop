@@ -1,4 +1,48 @@
 import { ipcRenderer, contextBridge } from 'electron'
+import { readFileSync } from 'fs'
+import orbitIcon from '../renderer/src/lib/assets/images/orbit.png?asset'
+
+// The Open WebUI client is rendered in a <webview>, rather than the desktop
+// renderer. Apply managed branding here so it reaches the guest page as well.
+const orbitIconData = `data:image/png;base64,${readFileSync(orbitIcon).toString('base64')}`
+
+const applyOrbitBranding = (): void => {
+  if (!document.documentElement) return
+
+  document.title = 'Omio Orbit'
+
+  for (const element of document.querySelectorAll<HTMLElement>('*')) {
+    const text = element.textContent?.trim()
+    if (text !== 'Open WebUI' && text !== 'orbit') continue
+
+    element.textContent = text === 'orbit' ? 'Orbit' : 'Omio Orbit'
+    const header = element.parentElement
+    const oldIcon = header?.querySelector('img, svg')
+    if (!oldIcon || oldIcon.getAttribute('data-orbit-icon') === 'true') continue
+
+    const image = document.createElement('img')
+    image.src = orbitIconData
+    image.alt = 'Omio Orbit'
+    image.setAttribute('data-orbit-icon', 'true')
+    image.style.cssText = 'width:1.5rem;height:1.5rem;object-fit:contain;flex:none;'
+    oldIcon.replaceWith(image)
+  }
+}
+
+const startOrbitBranding = (): void => {
+  applyOrbitBranding()
+  new MutationObserver(applyOrbitBranding).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    characterData: true
+  })
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', startOrbitBranding, { once: true })
+} else {
+  startOrbitBranding()
+}
 
 // ─── Desktop ↔ Open WebUI Generic Protocol ──────────────
 // This preload is a dumb relay. It passes typed {type, data}

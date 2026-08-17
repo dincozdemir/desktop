@@ -33,7 +33,10 @@ import {
   getServerPIDs,
   getServerPty,
   installPackage,
+  installOpenWebUISource,
   installPython,
+  isOpenWebUISourceAvailable,
+  needsOpenWebUISourceInstall,
   isPackageInstalled,
   isPythonInstalled,
   getPackageVersion,
@@ -44,7 +47,6 @@ import {
   setConfig,
   startServer,
   stopAllServers,
-  uninstallPython,
   validateRemoteUrl,
   type AppConfig,
   type Connection
@@ -58,6 +60,8 @@ import {
   getOpenTerminalLog,
   validateOpenTerminalProcess
 } from './utils/open-terminal'
+
+import { getComputerInfo, startComputer, stopComputer } from './utils/computer'
 
 import {
   setupLlamaCpp,
@@ -87,9 +91,12 @@ import { initUpdater, checkForUpdates, downloadUpdate, installUpdate } from './u
 import log from 'electron-log'
 log.transports.file.resolvePathFn = () => getLogFilePath('main')
 
-import icon from '../../resources/icon.png?asset'
+import icon from '../renderer/src/lib/assets/images/orbit.png?asset'
+import trayIcon from '../../resources/tray.png?asset'
 
-import { existsSync, writeFileSync, unlinkSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs'
+
+const managedIconData = `data:image/png;base64,${readFileSync(icon).toString('base64')}`
 
 if (process.platform === 'linux') {
   app.commandLine.appendSwitch('no-sandbox')
@@ -163,6 +170,29 @@ let SERVER_PID: number | null = null
 let AUTH_TOKEN: string | null = null
 let voiceInputRecording = false
 
+// Installers and MDM can supply the initial sidecar configuration without
+// opening any setup pages. Secrets come from the environment, never argv.
+const applyComputerProvisioningEnvironment = async (): Promise<void> => {
+  const upstreamUrl = process.env.WU_COMPUTER_UPSTREAM_URL?.trim()
+  const upstreamApiKey = process.env.WU_COMPUTER_UPSTREAM_API_KEY
+  const upstreamModel = process.env.WU_COMPUTER_UPSTREAM_MODEL?.trim()
+  const hasUpstreamModel = Object.hasOwn(process.env, 'WU_COMPUTER_UPSTREAM_MODEL')
+  const workspace = process.env.WU_COMPUTER_WORKSPACE?.trim()
+  if (!upstreamUrl && !upstreamApiKey && !hasUpstreamModel && !workspace) return
+
+  const config = await getConfig()
+  await setConfig({
+    computer: {
+      ...config.computer,
+      enabled: true,
+      ...(upstreamUrl ? { upstreamUrl } : {}),
+      ...(upstreamApiKey ? { upstreamApiKey } : {}),
+      ...(hasUpstreamModel ? { upstreamModel: upstreamModel ?? '' } : {}),
+      ...(workspace ? { workspace } : {})
+    }
+  })
+}
+
 // ─── Global Shortcuts ───────────────────────────────────
 
 /**
@@ -223,15 +253,20 @@ function tryRegisterShortcut(
   }
 }
 
-const registerShortcuts = (globalAccel?: string, spotlightAccel?: string, voiceInputAccel?: string, callAccel?: string): void => {
+const registerShortcuts = (
+  globalAccel?: string,
+  spotlightAccel?: string,
+  voiceInputAccel?: string,
+  callAccel?: string
+): void => {
   globalShortcut.unregisterAll()
 
   // On Wayland / Flatpak global shortcuts are unsupported — skip silently.
   if (!isGlobalShortcutSupported()) {
     log.info(
       'Global shortcut registration skipped — unsupported environment ' +
-      `(XDG_SESSION_TYPE=${process.env['XDG_SESSION_TYPE'] ?? '(unset)'}, ` +
-      `FLATPAK_ID=${process.env['FLATPAK_ID'] ?? '(unset)'})`
+        `(XDG_SESSION_TYPE=${process.env['XDG_SESSION_TYPE'] ?? '(unset)'}, ` +
+        `FLATPAK_ID=${process.env['FLATPAK_ID'] ?? '(unset)'})`
     )
     return
   }
@@ -251,9 +286,8 @@ const registerShortcuts = (globalAccel?: string, spotlightAccel?: string, voiceI
   // Spotlight shortcut – toggle the spotlight input bar
   if (spotlightAccel) {
     tryRegisterShortcut(spotlightAccel, 'Spotlight', () => {
-      const text = CONFIG?.spotlightClipboardPaste !== false
-        ? (clipboard.readText()?.trim() || '')
-        : ''
+      const text =
+        CONFIG?.spotlightClipboardPaste !== false ? clipboard.readText()?.trim() || '' : ''
       toggleSpotlight(text)
     })
   }
@@ -264,7 +298,9 @@ const registerShortcuts = (globalAccel?: string, spotlightAccel?: string, voiceI
       toggleVoiceInput()
     })
   } else {
-    log.info(`Voice input shortcut skipped — accel="${voiceInputAccel}", enabled=${CONFIG?.voiceInputEnabled}`)
+    log.info(
+      `Voice input shortcut skipped — accel="${voiceInputAccel}", enabled=${CONFIG?.voiceInputEnabled}`
+    )
   }
 
   // Call shortcut – open the voice/video call overlay
@@ -458,7 +494,10 @@ function playChime(ascending: boolean): Promise<void> {
     const exists = fs.existsSync(soundPath)
     log.info(`playChime: ${ascending ? 'start' : 'stop'}, path=${soundPath}, exists=${exists}`)
 
-    if (!exists) { resolve(); return }
+    if (!exists) {
+      resolve()
+      return
+    }
 
     if (process.platform === 'darwin') {
       execFile('afplay', [soundPath], (err, stdout, stderr) => {
@@ -466,9 +505,11 @@ function playChime(ascending: boolean): Promise<void> {
         resolve()
       })
     } else if (process.platform === 'win32') {
-      execFile('powershell', ['-NoProfile', '-Command',
-        `(New-Object Media.SoundPlayer '${soundPath}').PlaySync()`
-      ], () => resolve())
+      execFile(
+        'powershell',
+        ['-NoProfile', '-Command', `(New-Object Media.SoundPlayer '${soundPath}').PlaySync()`],
+        () => resolve()
+      )
     } else {
       execFile('paplay', [soundPath], (err) => {
         if (err) execFile('aplay', [soundPath], () => resolve())
@@ -599,7 +640,10 @@ function debounceSaveWindowBounds(win: BrowserWindow): void {
  */
 function isBoundsOnVisibleDisplay(bounds: { x: number; y: number }): boolean {
   const { screen } = require('electron')
-  const targetPoint = { x: bounds.x + MIN_VISIBLE_OVERLAP_PX / 2, y: bounds.y + MIN_VISIBLE_OVERLAP_PX / 2 }
+  const targetPoint = {
+    x: bounds.x + MIN_VISIBLE_OVERLAP_PX / 2,
+    y: bounds.y + MIN_VISIBLE_OVERLAP_PX / 2
+  }
   const display = screen.getDisplayNearestPoint(targetPoint)
   const { x, y, width, height } = display.workArea
   return (
@@ -714,6 +758,7 @@ function createContentWindow(url: string, connectionId: string): BrowserWindow {
     minHeight: MIN_WINDOW_HEIGHT,
     icon: path.join(__dirname, 'assets/icon.png'),
     show: false,
+    title: 'Omio Orbit',
     titleBarStyle: process.platform === 'win32' ? 'default' : 'hidden',
     trafficLightPosition: { x: 16, y: 16 },
     autoHideMenuBar: true,
@@ -731,7 +776,12 @@ function createContentWindow(url: string, connectionId: string): BrowserWindow {
   session
     .fromPartition(`persist:connection-${connectionId}`)
     .setPermissionRequestHandler((_webContents, permission, callback) => {
-      const allowedPermissions = ['media', 'mediaKeySystem', 'notifications', 'clipboard-sanitized-write']
+      const allowedPermissions = [
+        'media',
+        'mediaKeySystem',
+        'notifications',
+        'clipboard-sanitized-write'
+      ]
       callback(allowedPermissions.includes(permission))
     })
 
@@ -742,6 +792,85 @@ function createContentWindow(url: string, connectionId: string): BrowserWindow {
   contentWindow.webContents.setWindowOpenHandler((details) => {
     openUrl(details.url)
     return { action: 'deny' }
+  })
+
+  // The embedded page attempts to set its own document title after loading.
+  // Keep macOS's native title bar branded independently of that page state.
+  contentWindow.on('page-title-updated', (event) => {
+    event.preventDefault()
+    contentWindow?.setTitle('Omio Orbit')
+  })
+  contentWindow.webContents.on('did-finish-load', () => {
+    contentWindow?.setTitle('Omio Orbit')
+  })
+
+  // Open WebUI does not offer a setting to remove the single-model picker.
+  // The managed gateway exposes and enforces only "orbit"; hide the redundant
+  // control in the local managed client as well. This runs in the page's DOM
+  // after each navigation so it also covers SPA route changes.
+  contentWindow.webContents.on('dom-ready', () => {
+    if (
+      !contentWindow ||
+      contentWindow.isDestroyed() ||
+      !contentWindow.webContents.getURL().startsWith('http://127.0.0.1:')
+    )
+      return
+    void contentWindow.webContents
+      .executeJavaScript(
+        `
+      (() => {
+        if (window.__orbitManagedShell) return;
+        window.__orbitManagedShell = true;
+        const iconUrl = '${managedIconData}';
+        document.title = 'Omio Orbit';
+        const hidePicker = () => {
+          for (const button of document.querySelectorAll('button')) {
+            const text = (button.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            const label = (button.getAttribute('aria-label') || '').toLowerCase();
+            if (text === 'orbit' || label.includes('select a model')) {
+              button.style.setProperty('display', 'none', 'important');
+              button.setAttribute('aria-hidden', 'true');
+              button.tabIndex = -1;
+            }
+          }
+
+          // Open WebUI renders its built-in "Suggested" starter prompts when
+          // the configured suggestions list is empty. Hide that optional
+          // section in the managed shell rather than supplying fake prompts.
+          for (const element of document.querySelectorAll('*')) {
+            // The label contains a lightning icon, so it is not necessarily a
+            // leaf node. Its grandparent is the compact starter-card section.
+            if (element.textContent?.trim() !== 'Suggested') continue;
+            const section = element.parentElement?.parentElement;
+            if (section) {
+              section.style.setProperty('display', 'none', 'important');
+            }
+          }
+        };
+        const applyBranding = () => {
+          document.title = 'Omio Orbit';
+          for (const element of document.querySelectorAll('*')) {
+            const text = element.textContent?.trim();
+            if (text !== 'Open WebUI' && text !== 'orbit') continue;
+            const header = element.parentElement;
+            element.textContent = text === 'orbit' ? 'Orbit' : 'Omio Orbit';
+            const oldIcon = header?.querySelector('img, svg');
+            if (!oldIcon || oldIcon.getAttribute('data-orbit-icon') === 'true') continue;
+            const image = document.createElement('img');
+            image.src = iconUrl;
+            image.alt = 'Omio Orbit';
+            image.setAttribute('data-orbit-icon', 'true');
+            image.style.cssText = 'width:1.5rem;height:1.5rem;object-fit:contain;flex:none;';
+            oldIcon.replaceWith(image);
+          }
+        };
+        hidePicker();
+        applyBranding();
+        new MutationObserver(() => { hidePicker(); applyBranding(); }).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+      })();
+    `
+      )
+      .catch((error) => log.warn('Could not hide managed model picker:', error))
   })
 
   contentWindow.loadURL(url)
@@ -782,21 +911,23 @@ const updateTray = () => {
 
   // Virtual local connection (when package is installed)
   const localItem = isPackageInstalled('open-webui')
-    ? [{
-        label: `${CONFIG.defaultConnectionId === 'local' ? '★ ' : ''}Open WebUI (Local)`,
-        sublabel: SERVER_URL || `http://127.0.0.1:${CONFIG.localServer?.port ?? 8080}`,
-        click: async () => {
-          const result = await connectTo(buildLocalConnection())
-          if (result) sendToRenderer('connection:open', result)
+    ? [
+        {
+          label: `${CONFIG.defaultConnectionId === 'local' ? '★ ' : ''}Omio Orbit`,
+          sublabel: SERVER_URL || `http://127.0.0.1:${CONFIG.localServer?.port ?? 8080}`,
+          click: async () => {
+            const result = await connectTo(buildLocalConnection())
+            if (result) sendToRenderer('connection:open', result)
+          }
         }
-      }]
+      ]
     : []
 
   const allItems = [...localItem, ...remoteItems]
 
   const trayMenuTemplate = [
     {
-      label: 'Show Open WebUI',
+      label: 'Show Omio Orbit',
       click: () => {
         mainWindow?.show()
         mainWindow?.focus()
@@ -804,11 +935,7 @@ const updateTray = () => {
     },
     { type: 'separator' },
     ...(allItems.length > 0
-      ? [
-          { label: 'Connections', enabled: false },
-          ...allItems,
-          { type: 'separator' }
-        ]
+      ? [{ label: 'Connections', enabled: false }, ...allItems, { type: 'separator' }]
       : []),
     ...(SERVER_STATUS === 'started' && SERVER_URL
       ? [
@@ -822,7 +949,7 @@ const updateTray = () => {
         ]
       : []),
     {
-      label: 'Quit Open WebUI',
+      label: 'Quit Omio Orbit',
       accelerator: 'CommandOrControl+Q',
       click: async () => {
         await stopServerHandler()
@@ -845,7 +972,7 @@ const buildLocalConnection = (): Connection => {
   const port = CONFIG?.localServer?.port ?? 8080
   return {
     id: 'local',
-    name: 'Open WebUI',
+    name: 'Omio Orbit',
     type: 'local',
     url: SERVER_URL || `http://127.0.0.1:${port}`
   }
@@ -924,11 +1051,23 @@ const startServerHandler = async (): Promise<boolean> => {
   try {
     CONFIG = await getConfig()
 
+    if (CONFIG.computer?.enabled) {
+      sendToRenderer('status:computer', 'starting')
+      await startComputer((message) => sendToRenderer('status:computer-setup', message))
+      CONFIG = await getConfig()
+      sendToRenderer('status:computer', 'started')
+    }
+
     // Auto-update the open-webui pip package to latest before starting.
     // Only when autoUpdate is enabled (default) and no version pin is set.
     const autoUpdate = CONFIG?.localServer?.autoUpdate !== false
     const versionPin = CONFIG?.localServer?.version
-    if (autoUpdate && !versionPin && isPackageInstalled('open-webui')) {
+    if (
+      !isOpenWebUISourceAvailable() &&
+      autoUpdate &&
+      !versionPin &&
+      isPackageInstalled('open-webui')
+    ) {
       try {
         log.info('[server] Auto-updating open-webui package to latest…')
         sendToRenderer('status:install', 'Updating Open WebUI…')
@@ -1116,6 +1255,10 @@ const connectLlamaCppPtyPort = (): void => {
 const stopServerHandler = async (): Promise<boolean> => {
   try {
     await stopAllServers()
+    if (CONFIG?.computer?.enabled) {
+      await stopComputer()
+      sendToRenderer('status:computer', 'stopped')
+    }
     if (SERVER_STATUS) {
       SERVER_STATUS = 'stopped'
       updateTray()
@@ -1188,20 +1331,36 @@ if (!gotTheLock) {
   })
 
   app.setAboutPanelOptions({
-    applicationName: 'Open WebUI',
+    applicationName: 'Omio Orbit',
     iconPath: icon,
     applicationVersion: app.getVersion(),
     version: app.getVersion(),
-    website: 'https://openwebui.com',
-    copyright: `© ${new Date().getFullYear()} Open WebUI`
+    website: 'https://www.omio.com',
+    copyright: `© ${new Date().getFullYear()} Omio`
   })
 
   app.whenReady().then(async () => {
     CONFIG = await getConfig()
+    await applyComputerProvisioningEnvironment()
+    CONFIG = await getConfig()
     loadSpotlightPosition()
-    log.info('Config:', CONFIG)
+    log.info('Config:', {
+      ...CONFIG,
+      computer: {
+        ...CONFIG.computer,
+        gatewayKey: CONFIG.computer.gatewayKey ? '[redacted]' : '',
+        upstreamApiKey: CONFIG.computer.upstreamApiKey ? '[redacted]' : ''
+      },
+      openTerminal: {
+        ...CONFIG.openTerminal,
+        apiKey: CONFIG.openTerminal.apiKey ? '[redacted]' : ''
+      },
+      envVars: Object.fromEntries(
+        Object.keys(CONFIG.envVars ?? {}).map((key) => [key, '[redacted]'])
+      )
+    })
 
-    app.name = 'Open WebUI'
+    app.name = 'Omio Orbit'
     if (process.platform === 'darwin' && app.dock) {
       app.dock.setIcon(icon)
     }
@@ -1214,9 +1373,7 @@ if (!gotTheLock) {
     // shortcut targets (see issue #110).
     app.on('child-process-gone', (_event, details) => {
       if (details.type === 'GPU') {
-        log.error(
-          `GPU process gone: reason=${details.reason}, exitCode=${details.exitCode}`
-        )
+        log.error(`GPU process gone: reason=${details.reason}, exitCode=${details.exitCode}`)
 
         // Only auto-recover from fatal crashes, not normal/clean exits
         if (
@@ -1253,7 +1410,7 @@ if (!gotTheLock) {
     app.on('certificate-error', (event, _webContents, url, error, certificate, callback) => {
       log.warn(
         `Certificate error: ${error} for ${url} ` +
-        `(subject: ${certificate.subjectName}, issuer: ${certificate.issuerName})`
+          `(subject: ${certificate.subjectName}, issuer: ${certificate.issuerName})`
       )
       event.preventDefault()
       callback(true)
@@ -1275,7 +1432,13 @@ if (!gotTheLock) {
       // Grant media / notification permissions for webview partition sessions
       // so that auth flows, media capture, and notifications work correctly.
       newSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-        const allowed = ['media', 'mediaKeySystem', 'notifications', 'clipboard-read', 'clipboard-sanitized-write']
+        const allowed = [
+          'media',
+          'mediaKeySystem',
+          'notifications',
+          'clipboard-read',
+          'clipboard-sanitized-write'
+        ]
         callback(allowed.includes(permission))
       })
     })
@@ -1286,9 +1449,7 @@ if (!gotTheLock) {
       // Auto-reload when the renderer process dies so the user doesn't
       // see a permanent blank/grey screen.
       window.webContents.on('render-process-gone', (_event, details) => {
-        log.error(
-          `Renderer process gone: reason=${details.reason}, exitCode=${details.exitCode}`
-        )
+        log.error(`Renderer process gone: reason=${details.reason}, exitCode=${details.exitCode}`)
         if (details.reason !== 'clean-exit') {
           window.webContents.reload()
         }
@@ -1306,7 +1467,7 @@ if (!gotTheLock) {
         if (details.reason !== 'clean-exit') {
           log.error(
             `WebContents render-process-gone: type=${contents.getType()}, ` +
-            `reason=${details.reason}, exitCode=${details.exitCode}`
+              `reason=${details.reason}, exitCode=${details.exitCode}`
           )
         }
       })
@@ -1379,9 +1540,7 @@ if (!gotTheLock) {
             )
           } else if (params.selectionText) {
             // Non-editable text selection
-            menuItems.push(
-              { label: 'Copy', role: 'copy', enabled: params.editFlags.canCopy }
-            )
+            menuItems.push({ label: 'Copy', role: 'copy', enabled: params.editFlags.canCopy })
           }
 
           if (menuItems.length > 0) {
@@ -1431,7 +1590,12 @@ if (!gotTheLock) {
       CONFIG = await getConfig()
       updateTray()
       voiceInputRecording = false
-      registerShortcuts(CONFIG.globalShortcut, CONFIG.spotlightShortcut, CONFIG.voiceInputShortcut, CONFIG.callShortcut)
+      registerShortcuts(
+        CONFIG.globalShortcut,
+        CONFIG.spotlightShortcut,
+        CONFIG.voiceInputShortcut,
+        CONFIG.callShortcut
+      )
     })
 
     // Python/uv
@@ -1445,7 +1609,11 @@ if (!gotTheLock) {
         return res
       } catch (error) {
         sendToRenderer('status:python', false)
-        sendToRenderer('error', { message: error?.message ?? 'Python installation failed. Please check your internet connection and try again.' })
+        sendToRenderer('error', {
+          message:
+            error?.message ??
+            'Python installation failed. Please check your internet connection and try again.'
+        })
         return false
       }
     })
@@ -1468,9 +1636,7 @@ if (!gotTheLock) {
         sendToRenderer('status:install', 'Installing Open Terminal…')
         await installPackage('open-terminal', otVersion, (status: string) => {
           sendToRenderer('status:install', status)
-        }).catch((e) =>
-          log.warn('open-terminal install failed (non-fatal):', e)
-        )
+        }).catch((e) => log.warn('open-terminal install failed (non-fatal):', e))
         sendToRenderer('status:package', true)
         // Notify renderer of install state change
         sendToRenderer('packages:changed', {
@@ -1487,12 +1653,29 @@ if (!gotTheLock) {
         return true
       } catch (error) {
         sendToRenderer('status:package', false)
-        sendToRenderer('error', { message: error?.message ?? 'Package installation failed. Please check your internet connection and try again.' })
+        sendToRenderer('error', {
+          message:
+            error?.message ??
+            'Package installation failed. Please check your internet connection and try again.'
+        })
         return false
       }
     })
 
     ipcMain.handle('status:package', async () => isPackageInstalled('open-webui'))
+
+    ipcMain.handle('computer:start', async () => {
+      const current = await getConfig()
+      await setConfig({ computer: { ...current.computer, enabled: true } })
+      CONFIG = await getConfig()
+      return await startComputer((message) => sendToRenderer('status:computer-setup', message))
+    })
+    ipcMain.handle('computer:stop', async () => {
+      await stopComputer()
+      sendToRenderer('status:computer', 'stopped')
+      return true
+    })
+    ipcMain.handle('computer:info', () => getComputerInfo())
 
     // Server
     ipcMain.handle('server:start', () => startServerHandler())
@@ -1546,18 +1729,21 @@ if (!gotTheLock) {
       return config.connections
     })
 
-    ipcMain.handle('connections:update', async (_event, id: string, updates: Partial<Connection>) => {
-      const config = await getConfig()
-      const idx = config.connections.findIndex((c) => c.id === id)
-      if (idx !== -1) {
-        config.connections[idx] = { ...config.connections[idx], ...updates }
-        await setConfig(config)
-        CONFIG = config
-        updateTray()
-        sendToRenderer('connections:changed', config.connections)
+    ipcMain.handle(
+      'connections:update',
+      async (_event, id: string, updates: Partial<Connection>) => {
+        const config = await getConfig()
+        const idx = config.connections.findIndex((c) => c.id === id)
+        if (idx !== -1) {
+          config.connections[idx] = { ...config.connections[idx], ...updates }
+          await setConfig(config)
+          CONFIG = config
+          updateTray()
+          sendToRenderer('connections:changed', config.connections)
+        }
+        return config.connections
       }
-      return config.connections
-    })
+    )
 
     ipcMain.handle('connections:setDefault', async (_event, id: string) => {
       const config = await getConfig()
@@ -1664,9 +1850,11 @@ if (!gotTheLock) {
                 body: 'Open WebUI needs Screen Recording access to capture screenshots. Please enable it in System Settings → Privacy & Security → Screen Recording, then restart the app.'
               }).show()
               // Open the correct System Preferences pane
-              shell.openExternal(
-                'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'
-              ).catch(() => {})
+              shell
+                .openExternal(
+                  'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'
+                )
+                .catch(() => {})
               return 'no-permission'
             }
           }
@@ -1691,8 +1879,7 @@ if (!gotTheLock) {
           })
 
           // Find the source matching this display
-          const source =
-            sources.find((s) => s.display_id === String(display.id)) || sources[0]
+          const source = sources.find((s) => s.display_id === String(display.id)) || sources[0]
           if (!source) {
             spotlightWindow?.setOpacity(1)
             return null
@@ -1744,84 +1931,95 @@ if (!gotTheLock) {
     })
 
     // Transcribe audio via the connected server's STT endpoint
-    ipcMain.handle('voiceInput:transcribe', async (_event, audioBuffer: ArrayBuffer, rendererToken?: string) => {
-      try {
-        const conn = await getDefaultConnection()
-        if (!conn) throw new Error('No connection configured. Set up a connection in Settings first.')
+    ipcMain.handle(
+      'voiceInput:transcribe',
+      async (_event, audioBuffer: ArrayBuffer, rendererToken?: string) => {
+        try {
+          const conn = await getDefaultConnection()
+          if (!conn)
+            throw new Error('No connection configured. Set up a connection in Settings first.')
 
-        const url = resolveConnectionUrl(conn)
+          const url = resolveConnectionUrl(conn)
 
-        // Use stored auth token (relayed from webview), fall back to renderer-provided or contentWindow
-        let token = AUTH_TOKEN || rendererToken || ''
-        if (!token) {
-          // Scan all webContents to find the Open WebUI webview and read its token
-          try {
-            const { webContents: wc } = require('electron')
-            const allContents = wc.getAllWebContents()
-            for (const contents of allContents) {
-              try {
-                if (contents.getType() === 'webview' && !contents.isDestroyed()) {
-                  const t = await contents.executeJavaScript(
-                    `localStorage.getItem('token') || ''`
-                  )
-                  if (t) { token = t; break }
+          // Use stored auth token (relayed from webview), fall back to renderer-provided or contentWindow
+          let token = AUTH_TOKEN || rendererToken || ''
+          if (!token) {
+            // Scan all webContents to find the Open WebUI webview and read its token
+            try {
+              const { webContents: wc } = require('electron')
+              const allContents = wc.getAllWebContents()
+              for (const contents of allContents) {
+                try {
+                  if (contents.getType() === 'webview' && !contents.isDestroyed()) {
+                    const t = await contents.executeJavaScript(
+                      `localStorage.getItem('token') || ''`
+                    )
+                    if (t) {
+                      token = t
+                      break
+                    }
+                  }
+                } catch {
+                  // Skip inaccessible webContents
                 }
-              } catch {
-                // Skip inaccessible webContents
               }
+            } catch {
+              log.warn('voiceInput:transcribe — could not extract token from webviews')
             }
-          } catch {
-            log.warn('voiceInput:transcribe — could not extract token from webviews')
           }
+
+          if (!token) {
+            throw new Error(
+              'Not authenticated. Open a connection and sign in before using voice input.'
+            )
+          }
+
+          // Build multipart form data manually using Node.js
+          const boundary = '----VoiceInput' + Date.now()
+          const buffer = Buffer.from(audioBuffer)
+          const filename = `recording-${Date.now()}.wav`
+
+          const header = [
+            `--${boundary}`,
+            `Content-Disposition: form-data; name="file"; filename="${filename}"`,
+            `Content-Type: audio/wav`,
+            '',
+            ''
+          ].join('\r\n')
+
+          const footer = `\r\n--${boundary}--\r\n`
+          const headerBuf = Buffer.from(header, 'utf-8')
+          const footerBuf = Buffer.from(footer, 'utf-8')
+          const body = Buffer.concat([headerBuf, buffer, footerBuf])
+
+          const response = await fetch(`${url}/api/v1/audio/transcriptions`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': `multipart/form-data; boundary=${boundary}`
+            },
+            body
+          })
+
+          if (!response.ok) {
+            const text = await response.text().catch(() => '')
+            throw new Error(
+              `Transcription failed (HTTP ${response.status}). ${text || 'Check that your server has Speech-to-Text configured.'}`
+            )
+          }
+
+          const result = await response.json()
+          return result
+        } catch (error: any) {
+          log.error('voiceInput:transcribe failed:', error)
+          new Notification({
+            title: 'Voice Input Failed',
+            body: error?.message || 'Transcription failed. Check logs for details.'
+          }).show()
+          throw error
         }
-
-        if (!token) {
-          throw new Error('Not authenticated. Open a connection and sign in before using voice input.')
-        }
-
-        // Build multipart form data manually using Node.js
-        const boundary = '----VoiceInput' + Date.now()
-        const buffer = Buffer.from(audioBuffer)
-        const filename = `recording-${Date.now()}.wav`
-
-        const header = [
-          `--${boundary}`,
-          `Content-Disposition: form-data; name="file"; filename="${filename}"`,
-          `Content-Type: audio/wav`,
-          '',
-          ''
-        ].join('\r\n')
-
-        const footer = `\r\n--${boundary}--\r\n`
-        const headerBuf = Buffer.from(header, 'utf-8')
-        const footerBuf = Buffer.from(footer, 'utf-8')
-        const body = Buffer.concat([headerBuf, buffer, footerBuf])
-
-        const response = await fetch(`${url}/api/v1/audio/transcriptions`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': `multipart/form-data; boundary=${boundary}`
-          },
-          body
-        })
-
-        if (!response.ok) {
-          const text = await response.text().catch(() => '')
-          throw new Error(`Transcription failed (HTTP ${response.status}). ${text || 'Check that your server has Speech-to-Text configured.'}`)
-        }
-
-        const result = await response.json()
-        return result
-      } catch (error: any) {
-        log.error('voiceInput:transcribe failed:', error)
-        new Notification({
-          title: 'Voice Input Failed',
-          body: error?.message || 'Transcription failed. Check logs for details.'
-        }).show()
-        throw error
       }
-    })
+    )
 
     // Voice input completed — deliver text to chat
     ipcMain.handle('voiceInput:done', async (_event, text: string) => {
@@ -2026,29 +2224,56 @@ if (!gotTheLock) {
     ipcMain.handle('huggingface:repo:files', async (_event, repo: string, token?: string) => {
       return getRepoFiles(repo, token)
     })
-    ipcMain.handle('huggingface:models:download', async (_event, repo: string, filename: string, token?: string, expectedSize?: number) => {
-      try {
-        sendToRenderer('status:huggingface-download', { repo, filename, status: 'downloading', percent: 0 })
-        const filepath = await downloadModel(repo, filename, (progress) => {
+    ipcMain.handle(
+      'huggingface:models:download',
+      async (_event, repo: string, filename: string, token?: string, expectedSize?: number) => {
+        try {
           sendToRenderer('status:huggingface-download', {
-            repo, filename,
+            repo,
+            filename,
             status: 'downloading',
-            percent: progress.percent,
-            downloadedBytes: progress.downloadedBytes,
-            totalBytes: progress.totalBytes
+            percent: 0
           })
-        }, token, expectedSize)
-        sendToRenderer('status:huggingface-download', { repo, filename, status: 'done', filepath })
-        return filepath
-      } catch (error) {
-        log.error('Failed to download model:', error)
-        sendToRenderer('status:huggingface-download', { repo, filename, status: 'failed', error: error?.message })
-        sendToRenderer('error', { message: `Model download failed: ${error?.message}` })
-        return null
+          const filepath = await downloadModel(
+            repo,
+            filename,
+            (progress) => {
+              sendToRenderer('status:huggingface-download', {
+                repo,
+                filename,
+                status: 'downloading',
+                percent: progress.percent,
+                downloadedBytes: progress.downloadedBytes,
+                totalBytes: progress.totalBytes
+              })
+            },
+            token,
+            expectedSize
+          )
+          sendToRenderer('status:huggingface-download', {
+            repo,
+            filename,
+            status: 'done',
+            filepath
+          })
+          return filepath
+        } catch (error) {
+          log.error('Failed to download model:', error)
+          sendToRenderer('status:huggingface-download', {
+            repo,
+            filename,
+            status: 'failed',
+            error: error?.message
+          })
+          sendToRenderer('error', { message: `Model download failed: ${error?.message}` })
+          return null
+        }
       }
-    })
+    )
 
-    ipcMain.handle('package:version', (_event, packageName: string) => getPackageVersion(packageName))
+    ipcMain.handle('package:version', (_event, packageName: string) =>
+      getPackageVersion(packageName)
+    )
     ipcMain.handle('package:uninstall', async (_event, packageName: string) => {
       const result = uninstallPackage(packageName)
       // Notify renderer of install state change
@@ -2063,7 +2288,7 @@ if (!gotTheLock) {
       const result = await dialog.showOpenDialog(mainWindow!, {
         properties: ['openDirectory']
       })
-      return result.canceled ? null : result.filePaths[0] ?? null
+      return result.canceled ? null : (result.filePaths[0] ?? null)
     })
 
     ipcMain.handle('app:launchAtLogin:get', () => {
@@ -2119,15 +2344,20 @@ if (!gotTheLock) {
     // ─── Startup ──────────────────────────────────────
 
     // Create tray
-    const trayIcon = nativeImage.createFromPath(icon)
-    tray = new Tray(trayIcon.resize({ width: 16, height: 16 }))
-    tray.setToolTip('Open WebUI')
+    // The menu-bar icon is intentionally separate from the app/Dock icon so
+    // it follows resources/tray.png (including customer-provided updates).
+    const trayImage = nativeImage.createFromPath(trayIcon)
+    tray = new Tray(trayImage.resize({ width: 16, height: 16 }))
+    tray.setToolTip('Omio Orbit')
     updateTray()
 
-
-
     // Global shortcut
-    registerShortcuts(CONFIG.globalShortcut, CONFIG.spotlightShortcut, CONFIG.voiceInputShortcut, CONFIG.callShortcut)
+    registerShortcuts(
+      CONFIG.globalShortcut,
+      CONFIG.spotlightShortcut,
+      CONFIG.voiceInputShortcut,
+      CONFIG.callShortcut
+    )
 
     // Enable screen capture
     session.defaultSession.setDisplayMediaRequestHandler(
@@ -2170,6 +2400,38 @@ if (!gotTheLock) {
       } catch (error) {
         log.error('Auto-start llama.cpp failed:', error)
         sendToRenderer('status:llamacpp', 'failed')
+      }
+    }
+
+    // The integrated development launcher opts into an entirely non-interactive
+    // local install. Normal Desktop launches retain the existing setup UI.
+    if (process.env.WU_INTEGRATED_AUTOSTART === '1') {
+      try {
+        if (!isPythonInstalled()) {
+          sendToRenderer('status:install', 'Installing Python…')
+          await installPython(undefined, (status) => sendToRenderer('status:install', status))
+        }
+        if (isOpenWebUISourceAvailable() && needsOpenWebUISourceInstall()) {
+          sendToRenderer('status:install', 'Installing managed Omio Orbit source…')
+          await installOpenWebUISource((status) => sendToRenderer('status:install', status))
+        } else if (!isPackageInstalled('open-webui')) {
+          sendToRenderer('status:install', 'Installing Open WebUI…')
+          await installPackage('open-webui', undefined, (status) =>
+            sendToRenderer('status:install', status)
+          )
+        }
+        sendToRenderer('status:package', true)
+        sendToRenderer('packages:changed', { 'open-webui': true })
+        const integratedConfig = await getConfig()
+        if (!integratedConfig.defaultConnectionId) {
+          await setConfig({ defaultConnectionId: 'local' })
+          CONFIG = await getConfig()
+        }
+      } catch (error) {
+        log.error('Integrated local install failed:', error)
+        sendToRenderer('error', {
+          message: `Integrated local install failed: ${error?.message ?? error}`
+        })
       }
     }
 

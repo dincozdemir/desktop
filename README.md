@@ -78,3 +78,32 @@ npm run dev
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for release history. Licensed under [AGPL-3.0](LICENSE).
+
+## Managed Computer launcher
+
+The local Desktop runtime can start Open WebUI Computer as a loopback-only
+sidecar. On first start it installs the configured Computer fork, provisions a
+gateway key, adds `http://127.0.0.1:8000/v1` to the local Open WebUI runtime,
+and starts both services without opening a browser.
+
+An installer or MDM can supply initial provisioning values through environment
+variables. Do not put credentials on a command line:
+
+```text
+WU_COMPUTER_UPSTREAM_URL=https://ai.company.example/v1
+WU_COMPUTER_UPSTREAM_API_KEY=<secret>
+# Optional: when omitted, Computer discovers the first model from /models.
+WU_COMPUTER_UPSTREAM_MODEL=<model-id>
+WU_COMPUTER_WORKSPACE=/path/to/workspace
+# Optional local development/prebuilt wheel source:
+WU_COMPUTER_PACKAGE='cptr[all] @ file:///absolute/path/to/cptr-<version>-py3-none-any.whl'
+```
+
+The upstream key is used once to provision Computer and is then removed from
+the Desktop configuration. Desktop itself only connects to loopback services.
+
+For local development, build and launch the complete stack with one command:
+
+```bash
+npm run dev:integrated -- --upstream-url https://ai.company.example/v1
+```

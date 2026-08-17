@@ -3,6 +3,7 @@ _old
 node_modules
 dist
 out
+/vendor/open-webui/
 .DS_Store
 .eslintcache
 *.log*

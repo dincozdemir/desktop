@@ -82,6 +82,11 @@ const api = {
   installPackage: () => ipcRenderer.invoke('install:package'),
   getPackageStatus: () => ipcRenderer.invoke('status:package'),
 
+  // Open WebUI Computer
+  startComputer: () => ipcRenderer.invoke('computer:start'),
+  stopComputer: () => ipcRenderer.invoke('computer:stop'),
+  getComputerInfo: () => ipcRenderer.invoke('computer:info'),
+
   // Server
   startServer: () => ipcRenderer.invoke('server:start'),
   stopServer: () => ipcRenderer.invoke('server:stop'),

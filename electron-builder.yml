@@ -1,5 +1,6 @@
-appId: com.openwebui.desktop
-productName: Open WebUI
+appId: com.omio.orbit
+productName: Omio Orbit
+icon: src/renderer/src/lib/assets/images/orbit.png
 directories:
   buildResources: build
 files:
@@ -17,7 +18,7 @@ asarUnpack:
   - resources/**
   - node_modules/node-pty/**
 win:
-  executableName: open-webui
+  executableName: omio-orbit
 nsis:
   artifactName: ${name}-${arch}-setup.${ext}
   shortcutName: ${productName}

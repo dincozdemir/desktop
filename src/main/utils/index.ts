@@ -514,6 +514,68 @@ export const isPackageInstalled = (packageName: string): boolean => {
   }
 }
 
+/**
+ * A development or packaged Orbit build can provide an Open WebUI checkout.
+ * The application then runs that checkout instead of downloading the PyPI UI.
+ */
+export const getOpenWebUISourceDir = (): string | null => {
+  const configured = process.env.WU_OPEN_WEBUI_SOURCE_DIR?.trim()
+  if (!configured) return null
+  const sourceDir = path.resolve(configured)
+  return fs.existsSync(path.join(sourceDir, 'pyproject.toml')) ? sourceDir : null
+}
+
+export const isOpenWebUISourceAvailable = (): boolean => getOpenWebUISourceDir() !== null
+
+const getOpenWebUISourceInstallStamp = (): string =>
+  path.join(getUserDataPath(), 'orbit-open-webui-source-installed')
+
+export const needsOpenWebUISourceInstall = (): boolean => {
+  const sourceDir = getOpenWebUISourceDir()
+  if (!sourceDir) return false
+  const stamp = getOpenWebUISourceInstallStamp()
+  if (!fs.existsSync(stamp)) return true
+  try {
+    return fs.statSync(path.join(sourceDir, 'pyproject.toml')).mtimeMs > fs.statSync(stamp).mtimeMs
+  } catch {
+    return true
+  }
+}
+
+export const installOpenWebUISource = async (onStatus?: (status: string) => void): Promise<boolean> => {
+  const sourceDir = getOpenWebUISourceDir()
+  if (!sourceDir) throw new Error('Managed Open WebUI source checkout was not found')
+
+  const pythonPath = getPythonPath()
+  if (!fs.existsSync(pythonPath)) throw new Error('Python is not installed')
+
+  return new Promise((resolve, reject) => {
+    const commandProcess = spawn(
+      pythonPath,
+      ['-m', 'uv', 'pip', 'install', '--editable', sourceDir],
+      { env: pythonEnv() }
+    )
+    let lastLine = ''
+    const report = (data: Buffer): void => {
+      const line = data.toString().trim()
+      if (!line) return
+      lastLine = line
+      log.info(`[orbit-source] ${line}`)
+      onStatus?.(line)
+    }
+    commandProcess.stdout?.on('data', report)
+    commandProcess.stderr?.on('data', report)
+    commandProcess.on('error', (error) => reject(error))
+    commandProcess.on('exit', (code) => {
+      if (code === 0) {
+        fs.writeFileSync(getOpenWebUISourceInstallStamp(), sourceDir)
+        resolve(true)
+      }
+      else reject(new Error(lastLine || `Managed Open WebUI source install failed (exit code ${code})`))
+    })
+  })
+}
+
 export const getPackageVersion = (packageName: string): string | null => {
   const pythonPath = getPythonPath()
   if (!fs.existsSync(pythonPath)) return null
@@ -563,9 +625,45 @@ export const startServer = async (
   await stopAllServers()
   const config = await getConfig()
   const configEnvVars = config.envVars ?? {}
+  // The Computer sidecar exposes each local workspace as an OpenAI-compatible
+  // model. Its gateway is deliberately loopback-only; Desktop never talks to
+  // a remote model server directly.
+  const computerEnv = config.computer?.enabled && config.computer.gatewayKey
+    ? {
+        // This is a managed connection. Open WebUI normally saves connection
+        // settings in its database; an earlier manual connection would then
+        // override these variables and omit the sidecar gateway credential.
+        // Keep provider configuration process-managed while Computer is on.
+        ENABLE_PERSISTENT_CONFIG: 'false',
+        WEBUI_NAME: 'Omio Orbit',
+        // The gateway intentionally exposes exactly one branded model. The
+        // default keeps new chats out of the model-picker flow; model_ids is a
+        // second, server-side allow-list for this connection.
+        DEFAULT_MODELS: 'orbit',
+        DEFAULT_PINNED_MODELS: 'orbit',
+        USER_PERMISSIONS_CHAT_MULTIPLE_MODELS: 'false',
+        USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS: 'false',
+        ENABLE_DIRECT_CONNECTIONS: 'false',
+        ENABLE_API_KEYS: 'false',
+        ENABLE_EVALUATION_ARENA_MODELS: 'false',
+        // Avoid background task-model calls and keep the managed chat surface
+        // focused on user-authored prompts.
+        ENABLE_FOLLOW_UP_GENERATION: 'false',
+        ENABLE_AUTOCOMPLETE_GENERATION: 'false',
+        // Open WebUI ordinarily interprets an empty list as "use its starter
+        // prompts". Our managed source honours this explicit empty value.
+        DEFAULT_PROMPT_SUGGESTIONS: '[]',
+        OPENAI_API_BASE_URLS: `http://127.0.0.1:${config.computer.port || 8000}/v1`,
+        OPENAI_API_KEYS: config.computer.gatewayKey,
+        OPENAI_API_CONFIGS: JSON.stringify({
+          '0': { enable: true, connection_type: 'local', model_ids: ['orbit'] }
+        })
+      }
+    : {}
   const host = expose ? '0.0.0.0' : '127.0.0.1'
+  const sourceDir = getOpenWebUISourceDir()
   if (!isPythonInstalled()) throw new Error('Python is not installed')
-  if (!isPackageInstalled('open-webui')) throw new Error('open-webui package is not installed')
+  if (!sourceDir && !isPackageInstalled('open-webui')) throw new Error('open-webui package is not installed')
 
   const pythonPath = getPythonPath()
   log.info(`Using Python at: ${pythonPath}`)
@@ -574,6 +672,9 @@ export const startServer = async (
     throw new Error(`Python executable not found at: ${pythonPath}`)
   }
 
+  // The source install still exposes Open WebUI through its console script;
+  // it cannot be launched with `python -m open_webui` because that package has
+  // no __main__.py. With the editable install, this resolves to our checkout.
   const commandArgs = ['-m', 'uv', 'run', 'open-webui', 'serve', '--host', host]
   const dataDir = getOpenWebUIDataPath()
   const secretKey = getSecretKey()
@@ -601,6 +702,15 @@ export const startServer = async (
       rows: 50,
       env: pythonEnv({
         ...(configEnvVars ?? {}),
+        ...computerEnv,
+        ...(sourceDir
+          ? {
+              // Prefer the checked-out backend even when a previous PyPI
+              // installation is still present in the managed Python runtime.
+              PYTHONPATH: `${path.join(sourceDir, 'backend')}${path.delimiter}${process.env.PYTHONPATH ?? ''}`,
+              FRONTEND_BUILD_DIR: path.join(sourceDir, 'build')
+            }
+          : {}),
         DATA_DIR: dataDir,
         WEBUI_SECRET_KEY: secretKey,
         PYTHONUNBUFFERED: '1'
@@ -822,6 +932,15 @@ export interface AppConfig {
     serveOnLocalNetwork: boolean
     autoUpdate: boolean
   }
+  computer: {
+    enabled: boolean
+    port: number
+    workspace: string
+    gatewayKey: string
+    upstreamUrl: string
+    upstreamApiKey: string
+    upstreamModel: string
+  }
   openTerminal: {
     enabled: boolean
     port: number
@@ -860,6 +979,15 @@ const DEFAULT_CONFIG: AppConfig = {
     port: 8080,
     serveOnLocalNetwork: false,
     autoUpdate: true
+  },
+  computer: {
+    enabled: true,
+    port: 8000,
+    workspace: '',
+    gatewayKey: '',
+    upstreamUrl: '',
+    upstreamApiKey: '',
+    upstreamModel: ''
   },
   openTerminal: {
     enabled: false,
