@@ -21,6 +21,8 @@ import {
 
 const execFileAsync = promisify(execFile)
 const DEFAULT_PORT = 8000
+const GITHUB_MCP_VERSION = '1.0.5'
+const DEFAULT_GITHUB_MCP_TOOLSETS = 'all'
 // Install our fork because the headless bootstrap command is part of this
 // product integration, not the upstream PyPI release yet.
 const COMPUTER_PACKAGE =
@@ -37,6 +39,74 @@ type ComputerInfo = {
 let info: ComputerInfo | null = null
 
 const computerDataPath = (): string => path.join(getUserDataPath(), 'computer')
+
+const githubMcpBinaryPath = (): string =>
+  path.join(computerDataPath(), 'bin', 'github-mcp-server')
+
+const ensureGithubMcpServer = async (
+  onStatus?: (message: string) => void
+): Promise<string> => {
+  if (process.platform !== 'darwin') return ''
+
+  const binaryPath = githubMcpBinaryPath()
+  if (fs.existsSync(binaryPath)) return binaryPath
+
+  const arch = process.arch === 'arm64' ? 'arm64' : 'x86_64'
+  const assetName = `github-mcp-server_Darwin_${arch}.tar.gz`
+  const assetUrl =
+    `https://github.com/github/github-mcp-server/releases/download/v${GITHUB_MCP_VERSION}/${assetName}`
+  const binDir = path.dirname(binaryPath)
+  const archivePath = path.join(binDir, assetName)
+
+  try {
+    onStatus?.('Installing GitHub tools…')
+    fs.mkdirSync(binDir, { recursive: true })
+    const response = await fetch(assetUrl)
+    if (!response.ok) throw new Error(`GitHub MCP download failed (HTTP ${response.status})`)
+    fs.writeFileSync(archivePath, Buffer.from(await response.arrayBuffer()))
+    await execFileAsync('tar', ['-xzf', archivePath, '-C', binDir])
+    fs.rmSync(archivePath, { force: true })
+    if (!fs.existsSync(binaryPath)) throw new Error('GitHub MCP archive did not contain its binary')
+    fs.chmodSync(binaryPath, 0o755)
+    return binaryPath
+  } catch (error) {
+    fs.rmSync(archivePath, { force: true })
+    log.warn('GitHub MCP tools are unavailable:', error)
+    onStatus?.('GitHub tools could not be installed; continuing without them.')
+    return ''
+  }
+}
+
+const beginGithubLoginIfNeeded = async (
+  onStatus?: (message: string) => void
+): Promise<void> => {
+  try {
+    await execFileAsync('gh', ['auth', 'status', '--active', '--hostname', 'github.com'], {
+      env: processEnv()
+    })
+    return
+  } catch {
+    // GitHub CLI owns this browser flow and stores the resulting credential
+    // in the user's Keychain. It is intentionally detached from app startup.
+    onStatus?.('Sign in to GitHub in your browser to enable GitHub tools…')
+    const login = execFile(
+      'gh',
+      [
+        'auth',
+        'login',
+        '--hostname',
+        'github.com',
+        '--web',
+        '--git-protocol',
+        'https',
+        '--skip-ssh-key'
+      ],
+      { env: processEnv() },
+      () => {}
+    )
+    login.unref()
+  }
+}
 
 const generateSecret = (prefix = ''): string =>
   `${prefix}${crypto.randomBytes(32).toString('base64url')}`
@@ -64,16 +134,25 @@ const ensureComputerConfig = async (config: AppConfig): Promise<AppConfig> => {
   return config
 }
 
-const provision = async (config: AppConfig): Promise<AppConfig> => {
+const provision = async (
+  config: AppConfig,
+  onStatus?: (message: string) => void
+): Promise<AppConfig> => {
   const updated = await ensureComputerConfig(config)
   const computer = updated.computer
   const pythonPath = getPythonPath()
   const password = generateSecret()
+  const githubMcpPath = await ensureGithubMcpServer(onStatus)
+  if (githubMcpPath) await beginGithubLoginIfNeeded(onStatus)
+  const githubMcpToolsets =
+    process.env.WU_GITHUB_MCP_TOOLSETS || DEFAULT_GITHUB_MCP_TOOLSETS
   const environment = {
     ...processEnv(),
     CPTR_DATA_DIR: computerDataPath(),
     CPTR_BOOTSTRAP_PASSWORD: password,
     CPTR_GATEWAY_KEY: computer.gatewayKey,
+    ...(githubMcpPath ? { CPTR_GITHUB_MCP_PATH: githubMcpPath } : {}),
+    ...(githubMcpPath ? { CPTR_GITHUB_MCP_TOOLSETS: githubMcpToolsets } : {}),
     ...(computer.upstreamApiKey ? { CPTR_UPSTREAM_API_KEY: computer.upstreamApiKey } : {})
   }
   const args = [
@@ -98,6 +177,11 @@ const provision = async (config: AppConfig): Promise<AppConfig> => {
   // can provision idempotently without querying the upstream again after its
   // API key has been handed off to Computer's encrypted configuration.
   const discoveredModel = typeof result.upstream_model === 'string' ? result.upstream_model : ''
+  if (discoveredModel) {
+    const message = `Selected main-server model: ${discoveredModel}`
+    log.info(message)
+    onStatus?.(message)
+  }
   const computerWithModel =
     discoveredModel && discoveredModel !== computer.upstreamModel
       ? { ...computer, upstreamModel: discoveredModel }
@@ -142,7 +226,7 @@ export const startComputer = async (
     await installPackage(COMPUTER_PACKAGE)
   }
 
-  let config = await provision(await getConfig())
+  let config = await provision(await getConfig(), onStatus)
   let computer = config.computer
   const host = '127.0.0.1'
   let port = computer.port || DEFAULT_PORT

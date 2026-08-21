@@ -648,6 +648,8 @@ export const startServer = async (
         ENABLE_EVALUATION_ARENA_MODELS: 'false',
         // Avoid background task-model calls and keep the managed chat surface
         // focused on user-authored prompts.
+        ENABLE_TITLE_GENERATION: 'false',
+        ENABLE_TAGS_GENERATION: 'false',
         ENABLE_FOLLOW_UP_GENERATION: 'false',
         ENABLE_AUTOCOMPLETE_GENERATION: 'false',
         // Open WebUI ordinarily interprets an empty list as "use its starter

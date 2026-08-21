@@ -17,7 +17,8 @@ Usage:
 
 The upstream API key is read from WU_COMPUTER_UPSTREAM_API_KEY or requested
 silently. It is never accepted as a command-line argument. When --model is
-omitted, Computer selects the first model returned by URL/models.
+omitted, Computer selects the model whose ID is CPTR_MANAGED_MODEL_ID
+(default: "cptr") from URL/models.
 EOF
 }
 
@@ -60,7 +61,7 @@ fi
 
 export WU_COMPUTER_WORKSPACE="${WU_COMPUTER_WORKSPACE:-$HOME/Projects}"
 # Set this even when empty. It tells Desktop to clear an old explicit model
-# value and let Computer rediscover the current upstream model at /models.
+# value and let Computer rediscover the configured managed model at /models.
 export WU_COMPUTER_UPSTREAM_MODEL="${WU_COMPUTER_UPSTREAM_MODEL:-}"
 
 wheel_path="$(find "$computer_dir/dist" -maxdepth 1 -name 'cptr-*-py3-none-any.whl' -print 2>/dev/null | sort | tail -n 1)"
