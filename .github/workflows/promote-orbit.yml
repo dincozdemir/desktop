@@ -1,0 +1,25 @@
+name: Promote generic changes to Orbit
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request Orbit promotion
+        env:
+          TOKEN: ${{ secrets.ORBIT_PROMOTION_TOKEN }}
+          TARGET_REPOSITORY: dincozdemir/orbit-desktop
+          SHA: ${{ github.sha }}
+        run: |
+          test -n "$TOKEN"
+          curl --fail-with-body --retry 3 --retry-all-errors \
+            --request POST \
+            --url "https://api.github.com/repos/${TARGET_REPOSITORY}/dispatches" \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${TOKEN}" \
+            --data "{\"event_type\":\"promote-generic\",\"client_payload\":{\"source_repository\":\"${GITHUB_REPOSITORY}\",\"source_sha\":\"${SHA}\"}}"
